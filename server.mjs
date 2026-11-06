@@ -1,15 +1,14 @@
 import { createServer } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { languages, parseSrt } from './web/shared.mjs';
+import { builtInAvatars, localVoices, portraitReady, renderLocalStep } from './local-engine.mjs';
 
 const run = promisify(execFile);
 const root = dirname(fileURLToPath(import.meta.url));
@@ -27,8 +26,7 @@ const hosts = lanOrigin ? [origin.host] : [origin.host, `localhost:${port}`];
 const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
 const filters = spawnSync(ffmpeg, ['-hide_banner', '-filters'], { encoding: 'utf8', windowsHide: true, timeout: 4000 });
 const canRender = filters.status === 0 && /\bass\s+V->V/.test(filters.stdout) && /\boverlay\s+VV->V/.test(filters.stdout);
-const heyKey = process.env.HEYGEN_API_KEY;
-const aiKey = process.env.OPENAI_API_KEY;
+const aiModel = process.env.OLLAMA_MODEL;
 const defaults = {
   clinic: '연세솔안과', headline: '연세솔안과 진료안내', message: '영상에서 안내하는 내용을 차례대로 확인해 주세요.',
   notice: '이 영상에는 AI로 생성한 안내자가 등장합니다. 영상은 일반 안내이며, 개인별 진료는 담당 의료진의 안내를 따라 주세요.',
@@ -99,86 +97,49 @@ async function jsonBody(req) {
   }
 }
 
-async function provider(url, headers, body) {
-  const response = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...headers }, redirect: 'error',
-    method: body ? 'POST' : 'GET', body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(45_000)
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw Object.assign(fail(`외부 서비스 오류 (${response.status}) ${text(json.error?.message, 300)}`, 502), { providerStatus: response.status });
-  }
-  return json;
-}
-
-function hey(path, body) {
-  if (!heyKey) throw fail('원내 PC의 .env에 HeyGen API 키를 설정해 주세요.', 503);
-  return provider(`https://api.heygen.com/v3${path}`, { 'x-api-key': heyKey }, body);
-}
-
-async function catalog(path, query) {
-  const params = new URLSearchParams({ limit: '50' });
-  for (const key of ['token', 'language']) {
-    if (query.has(key)) params.set(key, text(query.get(key), 500));
-  }
-  const result = await hey(`${path}?${params}`);
-  return {
-    next: result.next_token || '',
-    items: (Array.isArray(result.data) ? result.data : []).map(item => ({
-      id: item.voice_id || item.id, name: item.name, language: item.language,
-      orientation: item.preferred_orientation, type: item.avatar_type, status: item.status
-    }))
-  };
-}
-
 async function askAi(input) {
-  if (!aiKey) throw fail('AI 초안·번역을 사용하려면 원내 PC의 .env에 OpenAI API 키를 설정해 주세요.', 503);
+  if (!aiModel || /cloud/i.test(aiModel)) throw fail('원내 PC에서 Ollama 로컬 모델을 설정해 주세요.', 503);
   if (!Object.hasOwn(languages, input.language)) throw fail('언어를 선택해 주세요.');
   const translating = input.mode === 'translate';
   const source = translating ? scriptFrom(input.source) : text(input.topic, 200);
   if (!source) throw fail('안내 주제를 입력해 주세요.');
-  const result = await provider('https://api.openai.com/v1/responses', { Authorization: `Bearer ${aiKey}` }, {
-    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini', store: false, max_output_tokens: 3500,
-    instructions: '안과의 환자 교육 원고를 작성한다. 환자 개인 정보와 개인별 진료 조언을 포함하지 않는다. 사실이나 수치, 처방, 기간을 지어내지 않는다. 번역에서는 원문의 지시와 순서를 유지한다. 각 단계는 쉬운 구어체를 사용한다. JSON 이외의 텍스트는 넣지 않는다.',
-    input: JSON.stringify({ operation: translating ? 'translate' : 'draft', outputLanguage: languages[input.language], source }),
-    text: { format: { type: 'json_schema', name: 'script', strict: true, schema: {
-      type: 'object', additionalProperties: false, required: ['title', 'steps'], properties: {
-        title: { type: 'string' }, steps: { type: 'array', minItems: 1, maxItems: 4, items: {
-          type: 'object', additionalProperties: false, required: ['title', 'body'],
-          properties: { title: { type: 'string' }, body: { type: 'string' } }
-        } }
-      }
-    } } }
-  });
-  const output = result.output?.flatMap(item => item.content || []).find(item => item.type === 'output_text')?.text;
-  if (!output) throw fail('AI 응답에 원고가 없습니다. 다시 시도해 주세요.', 502);
-  return scriptFrom({ ...JSON.parse(output), language: input.language });
-}
-
-function fromCdn(url) {
-  const asset = new URL(url);
-  if (asset.protocol !== 'https:' || asset.username || asset.password || asset.port
-      || !/(^|\.)(heygen\.ai|heygen\.com)$/.test(asset.hostname)) throw fail('HeyGen 미디어 주소를 확인할 수 없습니다.', 502);
-  return fetch(asset, { redirect: 'error', signal: AbortSignal.timeout(180_000) });
-}
-
-async function download(url, file, maxBytes) {
-  const response = await fromCdn(url);
-  if (!response.ok || !response.body) throw fail(`미디어 내려받기 오류 (${response.status})`, 502);
-  let bytes = 0;
-  const limit = new Transform({
-    transform(chunk, _encoding, callback) {
-      bytes += chunk.length;
-      callback(bytes > maxBytes ? new Error('미디어 용량 제한을 초과했습니다.') : null, chunk);
-    }
-  });
-  const part = `${file}.partial`;
+  const base = 'http://127.0.0.1:11434';
   try {
-    await pipeline(response.body, limit, createWriteStream(part));
-    renameSync(part, file);
-  } finally {
-    rmSync(part, { force: true });
+    const installed = await fetch(base + '/api/tags', { redirect: 'error', signal: AbortSignal.timeout(5000) });
+    const { models } = await installed.json();
+    if (!installed.ok || !models?.some(model => model.name === aiModel && model.size > 100_000_000 && !model.remote_host && !model.remote_model)) {
+      throw fail('지정한 Ollama 모델이 원내 PC에 설치되어 있지 않습니다.', 503);
+    }
+    const response = await fetch(base + '/api/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(180_000),
+      body: JSON.stringify({
+        model: aiModel, stream: false, options: { num_ctx: 8192, num_predict: 2600, temperature: 0.2 },
+        system: '안과 환자 교육 원고를 작성한다. 환자 개인 정보와 개인별 조언은 쓰지 않는다. 사실, 수치, 처방, 기간을 지어내지 않는다. 번역에서는 원문의 지시와 순서를 유지한다. 각 단계는 쉬운 구어체를 사용한다.',
+        prompt: JSON.stringify({ operation: translating ? 'translate' : 'draft', outputLanguage: languages[input.language], source }),
+        format: {
+          type: 'object', additionalProperties: false, required: ['title', 'steps'], properties: {
+            title: { type: 'string' }, steps: { type: 'array', minItems: 1, maxItems: 4, items: {
+              type: 'object', additionalProperties: false, required: ['title', 'body'],
+              properties: { title: { type: 'string' }, body: { type: 'string' } }
+            } }
+          }
+        }
+      })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.response) throw fail('로컬 AI가 원고를 반환하지 않았습니다.', 502);
+    return scriptFrom({ ...JSON.parse(result.response), language: input.language });
+  } catch (error) {
+    throw error.status ? error : fail('로컬 AI 연결이나 응답을 확인해 주세요.', 502);
   }
+}
+
+const avatars = () => [...builtInAvatars(), ...list('avatars')];
+const avatarView = ({ id, name, type }) => ({ id, name, type });
+
+function getAvatar(id) {
+  if (typeof id !== 'string') return null;
+  return builtInAvatars().find(avatar => avatar.id === id) || get('avatars', id);
 }
 
 function assTime(seconds) {
@@ -245,38 +206,21 @@ async function processJob(job) {
     job.status = 'completed';
     return;
   }
-  const clip = job.clips[index];
   job.status = 'generating';
-  if (!clip.providerId) {
-    job.submitting = true;
-    put('jobs', job);
-    const result = await hey('/videos', {
-      type: 'avatar', avatar_id: job.avatar, ...(job.voice ? { voice_id: job.voice } : {}),
-      title: `${job.title} (${index + 1}/${job.clips.length})`, aspect_ratio: job.ratio,
-      script: job.steps[index].body, caption: { file_format: 'srt' }, output_format: 'mp4'
-    });
-    clip.providerId = result.data?.id || result.data?.video_id;
-    if (!clip.providerId) throw fail('HeyGen에서 작업 ID를 받지 못했습니다.', 502);
-    job.submitting = false;
-    put('jobs', job);
-    return;
-  }
-  const { data: result } = await hey(`/videos/${encodeURIComponent(clip.providerId)}`);
-  if (['failed', 'cancelled', 'canceled'].includes(result?.status)) throw fail(text(result.failure_message || result.failure_code, 300) || 'HeyGen에서 영상 생성이 실패했습니다.');
-  if (result?.status !== 'completed') return;
-  const cwd = jobDir(job.id);
-  mkdirSync(cwd, { recursive: true, mode: 0o700 });
-  const rawFile = join(cwd, `raw-${index}.mp4`);
-  const srtFile = join(cwd, `raw-${index}.srt`);
-  if (!existsSync(rawFile)) await download(result.video_url, rawFile, 400_000_000);
-  if (result.subtitle_url && !existsSync(srtFile)) await download(result.subtitle_url, srtFile, 2_000_000);
-  clip.duration = Number(result.duration);
-  clip.ready = true;
+  put('jobs', job);
+  const avatar = getAvatar(job.avatar);
+  if (!avatar) throw new Error('원본 아바타가 삭제되었습니다. 새 아바타를 골라 다시 만들어 주세요.');
+  const { duration, path } = await renderLocalStep({
+    avatar, voice: job.voice, body: job.steps[index].body, language: job.language, ratio: job.ratio,
+    cwd: jobDir(job.id), index
+  });
+  renameSync(path, join(jobDir(job.id), `raw-${index}.mp4`));
+  job.clips[index] = { duration, ready: true };
 }
 
 for (const job of list('jobs')) {
-  if (job.submitting && activeStatuses.has(job.status)) {
-    put('jobs', { ...job, status: 'uncertain', error: '이전 요청의 접수 여부를 HeyGen 대시보드에서 확인해 주세요.' });
+  if (job.engine !== 'local' && activeStatuses.has(job.status) && !job.clips.every(clip => clip.ready)) {
+    put('jobs', { ...job, status: 'failed', error: '이전 엔진의 미완료 작업입니다. 원고로 로컬 영상을 새로 만들어 주세요.' });
   }
 }
 
@@ -289,17 +233,13 @@ async function tick() {
   try {
     await processJob(job);
     job.error = '';
-    job.failures = 0;
   } catch (error) {
-    const retryable = !job.submitting && job.status === 'generating' && (!error.status || error.status >= 500);
-    job.failures = (job.failures || 0) + 1;
-    if (!retryable || job.failures >= 5) {
-      const uncertain = job.submitting && (!error.providerStatus || error.providerStatus >= 500);
-      job.status = uncertain ? 'uncertain' : job.status === 'decorating' ? 'decoration_error' : 'failed';
-      job.error = uncertain ? '요청 접수 여부가 불명확합니다. HeyGen 대시보드에서 먼저 확인해 주세요.'
-        : error.cmd ? 'FFmpeg에서 영상 꾸미기에 실패했습니다. 자막·로고 설정과 FFmpeg 설치를 확인해 주세요.'
-          : text(error.message, 350);
-    }
+    const decorating = job.status === 'decorating';
+    job.status = decorating ? 'decoration_error' : 'failed';
+    job.error = error.cmd ? decorating ? '영상 꾸미기에 실패했습니다. FFmpeg와 자막·로고 설정을 확인해 주세요.'
+      : '로컬 엔진 실행에 실패했습니다. 원내 서버 콘솔의 오류를 확인해 주세요.'
+      : text(error.message, 350);
+    if (error.cmd) console.error(error.stderr?.trim() || error.code || 'Local engine error');
   } finally {
     put('jobs', job);
     processing = false;
@@ -406,13 +346,37 @@ async function router(req, res) {
   }
   if (read && path === '/api/state') return send(res, {
     scripts: list('scripts'), settings: settings(), jobs: list('jobs').map(jobView),
-    capabilities: { hey: !!heyKey, ai: !!aiKey, ffmpeg: canRender, lan: !!lanOrigin }
+    avatars: avatars().map(avatarView),
+    capabilities: { ai: !!aiModel, ffmpeg: canRender, portrait: portraitReady(), lan: !!lanOrigin }
   });
   if (read && path === '/api/jobs') return send(res, list('jobs').map(jobView));
-  if (read && path === '/api/avatars') return send(res, await catalog('/avatars/looks', url.searchParams));
-  if (read && path === '/api/voices') return send(res, await catalog('/voices', url.searchParams));
-  if (read && path === '/api/heygen') {
-    await hey('/users/me');
+  if (read && path === '/api/voices') {
+    const language = url.searchParams.get('language');
+    if (!Object.hasOwn(languages, language)) throw fail('음성 언어를 확인해 주세요.');
+    return send(res, (await localVoices(language)).map(({ id, name }) => ({ id, name })));
+  }
+  if (method === 'POST' && path === '/api/avatars') {
+    const body = await jsonBody(req);
+    const name = text(body.name, 40);
+    const image = body.image;
+    if (!name || body.consent !== true || typeof image !== 'string' ||
+        !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]{1,1400000}$/.test(image)) {
+      throw fail('아바타 이름, 사용 동의와 1MB 이하의 PNG 또는 JPEG 사진을 확인해 주세요.');
+    }
+    const bytes = Buffer.from(image.split(',')[1], 'base64');
+    const isPng = bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'));
+    const isJpeg = bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'));
+    if (image.startsWith('data:image/png') ? !isPng : !isJpeg) throw fail('사진 파일 형식을 확인해 주세요.');
+    const avatar = { id: randomUUID(), name, type: 'portrait', image };
+    put('avatars', avatar);
+    return send(res, avatarView(avatar), 201);
+  }
+  const avatarRoute = /^\/api\/avatars\/([a-f0-9-]{36})$/.exec(path);
+  if (method === 'DELETE' && avatarRoute) {
+    if (list('jobs').some(job => job.avatar === avatarRoute[1] && activeStatuses.has(job.status))) {
+      throw fail('이 아바타로 영상 작업을 진행 중입니다.', 409);
+    }
+    remove('avatars', avatarRoute[1]);
     return send(res, { ok: true });
   }
   if (method === 'POST' && path === '/api/ai') return send(res, await askAi(await jsonBody(req)));
@@ -442,14 +406,22 @@ async function router(req, res) {
   }
   if (method === 'POST' && path === '/api/jobs') {
     const body = await jsonBody(req);
-    if (!heyKey || !canRender) throw fail('영상 제작에는 HeyGen API 키와 자막 필터가 포함된 FFmpeg가 필요합니다.', 503);
-    const script = get('scripts', body.scriptId);
-    if (!script || !text(body.avatar, 150) || !['16:9', '9:16'].includes(body.ratio)) throw fail('원고, 아바타 ID와 화면비를 확인해 주세요.');
-    if (!/^[a-f0-9-]{36}$/.test(body.requestId)) throw fail('제작 요청 번호를 확인해 주세요.');
+    if (!canRender) throw fail('영상 제작에는 자막 필터가 포함된 FFmpeg가 필요합니다.', 503);
+    if (typeof body.requestId !== 'string' || !/^[a-f0-9-]{36}$/.test(body.requestId)) throw fail('제작 요청 번호를 확인해 주세요.');
     const existing = get('jobs', body.requestId);
     if (existing) return send(res, jobView(existing));
-    const job = { id: body.requestId, title: text(body.title, 60) || script.title, scriptId: script.id,
-      language: script.language, steps: script.steps, avatar: text(body.avatar, 150), voice: text(body.voice, 150),
+    const script = typeof body.scriptId === 'string' && get('scripts', body.scriptId);
+    const avatar = getAvatar(body.avatar);
+    if (!script || !avatar || !['16:9', '9:16'].includes(body.ratio)) throw fail('원고, 아바타와 화면비를 확인해 주세요.');
+    if (avatar.type === 'portrait' && !portraitReady()) throw fail('실사 아바타에는 원내 MuseTalk 모델 설정이 필요합니다.', 503);
+    const voices = await localVoices(script.language);
+    const voice = body.voice ? voices.find(item => item.id === body.voice) : voices[0];
+    if (!voice) throw fail('원고 언어에 해당하는 로컬 음성을 설정해 주세요.', 503);
+    const submitted = get('jobs', body.requestId);
+    if (submitted) return send(res, jobView(submitted));
+    if (!getAvatar(avatar.id)) throw fail('아바타 목록을 새로고침해 주세요.', 409);
+    const job = { id: body.requestId, engine: 'local', title: text(body.title, 60) || script.title, scriptId: script.id,
+      language: script.language, steps: script.steps, avatar: avatar.id, voice,
       ratio: body.ratio, decor: decorations(body), status: 'queued', createdAt: now(), clips: script.steps.map(() => ({})) };
     put('jobs', job);
     return send(res, jobView(job), 202);

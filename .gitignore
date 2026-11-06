@@ -1,5 +1,8 @@
 .env
 data/
+models/
+.venv*/
+__pycache__/
 *.pem
 *.key
 *.pfx

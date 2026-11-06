@@ -135,17 +135,41 @@ function createPage() {
       <label>영상 제목<input name="title" maxlength="60" value="${esc(choice.title ?? script?.title)}" required></label>
       <label>스크립트<select name="scriptId" required><option value="">원고를 선택해 주세요</option>
         ${state.scripts.map(item => `<option value="${item.id}" ${item.id === script?.id ? 'selected' : ''}>${esc(item.title)} · ${languages[item.language]}</option>`).join('')}</select></label>
-      <div class="two-fields"><label>아바타 ID<input name="avatar" maxlength="150" value="${esc(choice.avatar)}" required placeholder="직접 입력 또는 목록에서 선택"></label>
-        <label>음성 ID<input name="voice" maxlength="150" value="${esc(choice.voice)}" placeholder="비우면 아바타 기본 음성"></label></div>
-      <div class="actions">${button('아바타 목록', 'avatars')}${button('음성 목록', 'voices')}</div>
+      <div class="two-fields"><label>아바타<select name="avatar">${state.avatars.map(avatar =>
+        `<option value="${esc(avatar.id)}" ${avatar.id === choice.avatar ? 'selected' : ''} ${avatar.type === 'portrait' && !state.capabilities.portrait ? 'disabled' : ''}>${esc(avatar.name)}${avatar.type === 'portrait' ? ' · 실사' : ''}</option>`).join('')}</select></label>
+        <label>로컬 음성<select name="voice" required><option value="">음성을 확인하는 중입니다</option></select></label></div>
+      <div class="actions">${button('사진 아바타 관리', 'avatars')}</div>
       <label>화면비<select name="ratio"><option value="16:9">가로 16:9</option><option value="9:16" ${choice.ratio === '9:16' ? 'selected' : ''}>세로 9:16</option></select></label>
       ${decorationFields(choice)}
-      <div class="notice ${state.capabilities.hey && state.capabilities.ffmpeg ? '' : 'warn'}">${state.capabilities.hey && state.capabilities.ffmpeg
-        ? '제작을 누르면 원고와 영상 제목이 HeyGen으로 전송되며 영상 생성 크레딧이 사용됩니다. 환자를 식별할 수 있는 정보는 원고에 넣지 마세요.'
-        : '영상 제작을 시작하려면 원내 PC에 HeyGen API 키와 FFmpeg를 설정해 주세요.'}</div>
-      <div><button class="btn primary" type="submit" ${!script || !state.capabilities.hey || !state.capabilities.ffmpeg ? 'disabled' : ''}>영상 생성 요청</button></div>
+      <div class="notice ${state.capabilities.ffmpeg ? '' : 'warn'}">${state.capabilities.ffmpeg
+        ? '음성 합성과 영상 렌더링은 이 원내 서버에서 실행됩니다. 사진 아바타는 MuseTalk 모델을 사용합니다.'
+        : '영상 제작을 시작하려면 원내 PC에 FFmpeg와 원고 언어에 맞는 로컬 음성을 설치해 주세요.'}</div>
+      <div><button class="btn primary" type="submit" disabled>로컬 영상 만들기</button></div>
     </form><section class="card stack"><h2>화면 구성 미리보기</h2><div id="preview"></div>
       <p class="muted">미리보기에서 화면비, 배지, 자막 위치를 확인할 수 있습니다. 실제 음성과 영상은 생성 이력에서 확인합니다.</p></section></div>`);
+}
+
+async function updateVoices(form) {
+  const script = state.scripts.find(item => item.id === form.elements.scriptId.value);
+  const field = form.elements.voice;
+  const submit = form.querySelector('[type="submit"]');
+  submit.disabled = true;
+  const previous = field.value;
+  field.innerHTML = '<option value="">음성을 확인하는 중입니다</option>';
+  if (!script) {
+    field.innerHTML = '<option value="">스크립트를 먼저 선택해 주세요</option>';
+    return;
+  }
+  try {
+    const voices = await api('/voices?language=' + encodeURIComponent(script.language));
+    if (!form.isConnected || form.elements.scriptId.value !== script.id) return;
+    field.innerHTML = voices.map(voice =>
+      `<option value="${esc(voice.id)}" ${voice.id === previous ? 'selected' : ''}>${esc(voice.name)}</option>`).join('')
+      || '<option value="">사용 가능한 로컬 음성이 없습니다</option>';
+    submit.disabled = !voices.length || !state.capabilities.ffmpeg;
+  } catch {
+    if (form.isConnected && form.elements.scriptId.value === script.id) field.innerHTML = '<option value="">로컬 음성 목록을 읽지 못했습니다</option>';
+  }
 }
 
 function updatePreview() {
@@ -158,7 +182,7 @@ function updatePreview() {
   main.querySelector('#preview').innerHTML = `<div class="preview ${data.get('ratio') === '9:16' ? 'portrait' : ''}">
     <div class="preview-name">${esc(state.settings.clinic)}</div>
     ${decor.badge ? `<div class="preview-badge">1 / ${script?.steps.length || 1} · ${esc(first?.title || '안내 시작')}</div>` : ''}
-    <div class="preview-center">◇<br>${data.get('avatar') ? '선택한 아바타' : '아바타 영역'}</div>
+    <div class="preview-center">◇<br>${esc(state.avatars.find(avatar => avatar.id === data.get('avatar'))?.name || '아바타 영역')}</div>
     ${decor.captions ? `<div class="preview-caption">${esc(first?.body.slice(0, 44) || '자막 미리보기')}</div>` : ''}
     ${decor.showLogo && state.settings.logo ? `<img alt="병원 로고" class="preview-logo ${decor.position}" src="${esc(state.settings.logo)}">` : ''}</div>`;
 }
@@ -204,19 +228,20 @@ function settingsPage(isMessage) {
         <section class="card stack"><p class="eyebrow">환자 화면 미리보기</p><h2 data-preview="headline">${esc(s.headline)}</h2>
         <div class="preview"><div class="preview-center">▷ 영상 재생 영역</div></div>
         <div class="muted" data-preview="message">${esc(s.message)}</div><div class="notice" data-preview="notice">${esc(s.notice)}</div></section></div>`)
-    : page('05 / CLINIC SETTINGS', '병원 설정', '병원 로고와 자막 기본값을 지정하고 외부 서비스 연결을 확인합니다.',
+    : page('05 / CLINIC SETTINGS', '병원 설정', '병원 로고와 자막 기본값을 지정하고 원내 영상 엔진 상태를 확인합니다.',
       `<div class="grid"><form id="settings-form" class="card stack"><h2>브랜딩과 자막</h2>
       <label>병원 이름<input name="clinic" maxlength="30" required value="${esc(s.clinic)}"></label>
       <label>로고 파일 · PNG 또는 JPEG, 1MB 이하<input type="file" name="logo" accept="image/png,image/jpeg"></label>
       ${s.logo ? `<img class="logo" alt="현재 병원 로고" src="${esc(s.logo)}"><label class="check"><input type="checkbox" name="removeLogo"> 현재 로고 지우기</label>` : ''}
       ${decorationFields(s, false)}<div><button class="btn primary">병원 설정 저장</button></div></form>
-      <section class="card stack"><h2>연결 상태</h2>
-        <div>HeyGen API <span class="tag">${state.capabilities.hey ? '키 설정됨' : '미설정'}</span></div>
-        <div>OpenAI 초안·번역 <span class="tag">${state.capabilities.ai ? '키 설정됨' : '선택 기능 · 미설정'}</span></div>
+      <section class="card stack"><h2>원내 엔진 상태</h2>
+        <div>기본 아바타 <span class="tag">일러스트 안내자 2종</span></div>
+        <div>실사 입 모양 합성 <span class="tag">${state.capabilities.portrait ? 'MuseTalk 경로 설정됨' : '선택 기능 · 미설정'}</span></div>
+        <div>로컬 AI 초안·번역 <span class="tag">${state.capabilities.ai ? 'Ollama 모델 설정됨' : '선택 기능 · 미설정'}</span></div>
         <div>FFmpeg 합성 <span class="tag">${state.capabilities.ffmpeg ? '사용 가능' : '설치 필요'}</span></div>
         <div>접속 범위 <span class="tag">${state.capabilities.lan ? '설정한 원내망 주소' : '현재 PC'}</span></div>
-        <div class="actions">${button('HeyGen 연결 확인', 'checkHey')}${button('사용 가이드', 'guide')}</div>
-        <div class="notice">API 키는 원내 PC의 .env에서 관리합니다. 병원 설정을 바꾸면 새 영상에 적용됩니다.</div></section></div>`);
+        <div class="actions">${button('사용 가이드', 'guide')}</div>
+        <div class="notice">설치한 엔진의 경로는 원내 PC의 .env에서 관리합니다. 병원 설정을 바꾸면 새 영상에 적용됩니다.</div></section></div>`);
 }
 
 function render() {
@@ -229,6 +254,7 @@ function render() {
   logout.hidden = !state.capabilities.lan;
   main.innerHTML = { script: scriptPage, create: createPage, history: historyPage,
     message: () => settingsPage(true), settings: () => settingsPage(false) }[id]();
+  if (id === 'create') void updateVoices(main.querySelector('#create-form'));
   updatePreview();
 }
 
@@ -257,17 +283,16 @@ function downloadBackup(script) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function catalog(kind, token = '', language = '') {
-  const params = new URLSearchParams();
-  if (token) params.set('token', token);
-  if (language) params.set('language', language);
-  const result = await api('/' + kind + '?' + params);
-  modal(kind === 'avatars' ? 'HeyGen 아바타 목록' : 'HeyGen 음성 목록',
-    `<div class="stack">${kind === 'voices' ? '<div class="actions">' + button('한국어 음성', 'koreanVoice') + button('전체 음성', 'voices') + '</div>' : ''}
-    <div class="table-box"><table><tbody>${result.items.filter(item => item.id && (!item.status || item.status === 'completed'))
-      .map(item => `<tr><td><strong>${esc(item.name)}</strong> <span class="muted">${esc(item.language || item.type)}</span></td>
-      <td>${button('선택', kind === 'avatars' ? 'chooseAvatar' : 'chooseVoice', item.id)}</td></tr>`).join('') || emptyRow(2, '이 페이지에 선택 가능한 항목이 없습니다.')}</tbody></table></div>
-    <div>${result.next ? button('다음 목록', 'catalogNext', JSON.stringify([kind, result.next, language])) : ''}</div></div>`);
+function avatarManager() {
+  const rows = state.avatars.filter(avatar => avatar.type === 'portrait');
+  modal('사진 아바타 관리', `<div class="stack">
+    <div class="notice">촬영과 합성에 동의한 성인의 정면 사진을 사용해 주세요. 실사 합성은 원내 서버에 MuseTalk를 설치한 뒤 사용할 수 있습니다.</div>
+    <div class="table-box"><table><tbody>${rows.map(avatar => `<tr><td>${esc(avatar.name)}</td>
+    <td>${button('등록 사진 삭제', 'deleteAvatar', avatar.id, 'danger')}</td></tr>`).join('') || emptyRow(2, '등록된 사진 아바타가 없습니다.')}</tbody></table></div>
+    <form id="avatar-form" class="stack"><label>아바타 이름<input name="name" maxlength="40" required></label>
+    <label>정면 사진 · PNG 또는 JPEG<input type="file" name="photo" accept="image/png,image/jpeg" required></label>
+    <label class="check"><input type="checkbox" name="consent" required> 사진과 아바타 합성에 대한 사용 동의를 확인했습니다.</label>
+    <div><button class="btn primary">사진 아바타 등록</button></div></form></div>`);
 }
 
 function showShare(job, token = job.share) {
@@ -316,26 +341,24 @@ async function clickAction(action, id) {
     }
     case 'draft':
     case 'translate':
-      if (!state.capabilities.ai) throw Error('AI 초안과 번역을 사용하려면 원내 PC의 .env에 OpenAI API 키를 설정해 주세요.');
+      if (!state.capabilities.ai) throw Error('AI 초안과 번역을 사용하려면 원내 PC에 Ollama 모델을 설치하고 .env에 설정해 주세요.');
       if (action === 'draft') editor = collectEditor();
       modal(action === 'draft' ? 'AI 원고 초안' : '원고 번역', `<form id="ai-form" class="stack" data-mode="${action}" data-id="${id}">
         ${action === 'draft' ? '<label>안내 주제<input name="topic" maxlength="200" required></label>' : `<p>${esc(script.title)}</p>`}
         <label>결과 언어<select name="language">${languageOptions(action === 'draft' ? editor.language : 'en')}</select></label>
-        <div class="notice">주제 또는 일반 안내 원고가 OpenAI로 전송됩니다. 환자 정보는 입력하지 마세요. 초안은 의료진이 검토한 뒤 저장해 주세요.</div>
+        <div class="notice">원내 서버의 Ollama 모델에서 처리합니다. 초안은 의료진이 검토한 뒤 저장해 주세요.</div>
         <div><button class="btn primary">AI에 요청</button></div></form>`);
       return;
     case 'deleteScript':
       if (confirm('이 원고를 삭제하시겠습니까? 기존에 만든 영상은 보존됩니다.')) { await api('/scripts/' + id, 'DELETE'); await load(); }
       return;
-    case 'avatars':
-    case 'voices': await catalog(action); return;
-    case 'koreanVoice': await catalog('voices', '', 'Korean'); return;
-    case 'catalogNext': await catalog(...JSON.parse(id)); return;
-    case 'chooseAvatar':
-    case 'chooseVoice':
-      main.querySelector(`[name="${action === 'chooseAvatar' ? 'avatar' : 'voice'}"]`).value = id;
-      dialog.close();
-      updatePreview();
+    case 'avatars': avatarManager(); return;
+    case 'deleteAvatar':
+      if (confirm('등록 사진을 삭제하시겠습니까? 이미 만든 영상은 보존됩니다.')) {
+        await api('/avatars/' + id, 'DELETE');
+        await load();
+        avatarManager();
+      }
       return;
     case 'play':
       modal(job.title, `<video controls playsinline preload="metadata" src="${videoPath(id)}"></video>`);
@@ -355,14 +378,13 @@ async function clickAction(action, id) {
       return;
     case 'decorate':
       modal('다시 꾸미기', `<form id="decorate-form" class="stack" data-id="${id}">${decorationFields(job)}
-        <p class="muted">원본 영상에 자막과 로고를 다시 합성합니다. HeyGen 영상을 새로 요청하지 않습니다.</p>
+        <p class="muted">저장된 원본 영상으로 자막과 로고를 다시 합성합니다.</p>
         <div><button class="btn primary">다시 꾸미기</button></div></form>`);
       return;
     case 'deleteJob':
       if (confirm('영상과 공유 링크를 삭제하시겠습니까?')) { await api('/jobs/' + id, 'DELETE'); await load(); }
       return;
     case 'refresh': await load(); return;
-    case 'checkHey': await api('/heygen'); note('HeyGen API 연결을 확인했습니다.'); return;
     case 'guide':
       modal('사용 가이드', '<ol class="stack"><li>스크립트 등록에서 안내 원고를 저장합니다.</li><li>영상 만들기에서 원고, 아바타, 화면비를 선택합니다.</li><li>생성 이력에서 영상과 자막을 검수합니다.</li><li>완성본을 내려받거나 원내망 환자 안내 페이지로 공유합니다.</li></ol>');
       return;
@@ -400,13 +422,22 @@ async function submit(form) {
       break;
     }
     case 'create-form': {
-      if (!confirm('영상 제목과 원고를 HeyGen으로 보내 영상 제작을 요청하시겠습니까? 크레딧이 사용됩니다.')) return;
       form.dataset.requestId ||= crypto.randomUUID();
       await api('/jobs', 'POST', { ...fields, ...readDecor(form), requestId: form.dataset.requestId });
       createChoice = undefined;
       await load();
       navigate('history');
       note('영상 제작을 요청했습니다.');
+      break;
+    }
+    case 'avatar-form': {
+      const photo = data.get('photo');
+      if (!photo.size || photo.size > 1_000_000) throw Error('1MB 이하의 사진을 선택해 주세요.');
+      const result = await api('/avatars', 'POST', { name: fields.name, consent: data.has('consent'), image: await fileAsDataUrl(photo) });
+      createChoice = { ...createChoice, avatar: result.id };
+      await load();
+      avatarManager();
+      note('사진 아바타를 등록했습니다.');
       break;
     }
     case 'decorate-form':
@@ -464,7 +495,10 @@ document.addEventListener('input', event => {
     main.querySelector('#history-rows').innerHTML = historyRows();
   }
   if (field.form?.id === 'create-form') {
-    if (field.name === 'scriptId') field.form.elements.title.value = state.scripts.find(item => item.id === field.value)?.title || '';
+    if (field.name === 'scriptId') {
+      field.form.elements.title.value = state.scripts.find(item => item.id === field.value)?.title || '';
+      void updateVoices(field.form);
+    }
     updatePreview();
   }
   if (field.form?.id === 'message-form') main.querySelector(`[data-preview="${field.name}"]`).textContent = field.value;

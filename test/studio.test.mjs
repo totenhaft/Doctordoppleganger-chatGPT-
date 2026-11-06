@@ -21,7 +21,8 @@ test('SRT timing and paragraph titles are kept separate from narration', () => {
 test('local access, persistent scripts, and revocable video links', { timeout: 15_000 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), 'sol-studio-test-'));
   const origin = 'http://127.0.0.1:8787';
-  Object.assign(process.env, { PORT: '8787', CLINIC_ORIGIN: '', CLINIC_DATA_DIR: directory, HEYGEN_API_KEY: '', OPENAI_API_KEY: '' });
+  Object.assign(process.env, { PORT: '8787', CLINIC_ORIGIN: '', CLINIC_DATA_DIR: directory,
+    FFMPEG_PATH: join(directory, 'missing-ffmpeg'), OLLAMA_MODEL: '' });
   let app;
   const request = async (url, method = 'GET', body, headers = {}) => {
     const req = Object.assign(Readable.from(body ? [Buffer.from(JSON.stringify(body))] : []), {
@@ -48,6 +49,15 @@ test('local access, persistent scripts, and revocable video links', { timeout: 1
     const saved = await (await request('/api/scripts', 'POST', script)).json();
     assert.ok(saved.id);
     assert.equal((await request('/api/jobs', 'POST', {})).status, 503);
+    assert.equal((await request('/api/heygen')).status, 404);
+    assert.equal((await request('/api/ai', 'POST', { topic: '안약', language: 'ko' })).status, 503);
+    const portrait = { name: '테스트 아바타', image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jS3sAAAAASUVORK5CYII=' };
+    assert.equal((await request('/api/avatars', 'POST', portrait)).status, 400);
+    assert.equal((await request('/api/avatars', 'POST', { ...portrait, consent: true, image: 'data:image/png;base64,AAAA' })).status, 400);
+    const uploaded = await request('/api/avatars', 'POST', { ...portrait, consent: true });
+    assert.equal(uploaded.status, 201);
+    const avatar = await uploaded.json();
+    assert.equal(avatar.type, 'portrait');
     app.closeDatabase();
     app = null;
 
@@ -65,6 +75,10 @@ test('local access, persistent scripts, and revocable video links', { timeout: 1
     const state = await (await request('/api/state')).json();
     assert.equal(state.scripts[0].id, saved.id);
     assert.equal(state.jobs[0].status, 'completed');
+    assert.equal(state.avatars.filter(avatar => avatar.type === 'illustration').length, 2);
+    assert.deepEqual(state.avatars.find(item => item.id === avatar.id), avatar);
+    assert.equal((await request('/api/avatars/' + avatar.id, 'DELETE')).status, 200);
+    assert.equal((await (await request('/api/state')).json()).avatars.some(item => item.id === avatar.id), false);
     const published = await request('/api/jobs/' + id + '/share', 'POST', {});
     const { share } = await published.json();
     assert.match(share, /^[a-f0-9]{48}$/);
