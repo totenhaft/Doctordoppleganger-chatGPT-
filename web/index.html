@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>연세솔안과 진료안내 영상 스튜디오</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="#script"><span class="mark" aria-hidden="true">✦</span><span><strong>연세솔안과</strong><small>영상 스튜디오</small></span></a>
+      <p class="eyebrow nav-label">WORKSPACE</p>
+      <nav id="nav" aria-label="주요 메뉴">
+        <a href="#script"><span>01</span> 스크립트 등록</a>
+        <a href="#create"><span>02</span> 영상 만들기</a>
+        <a href="#history"><span>03</span> 생성 이력</a>
+        <a href="#message"><span>04</span> 안내문구 설정</a>
+        <a href="#settings"><span>05</span> 병원 설정</a>
+      </nav>
+      <div class="sidebar-foot"><span class="dot"></span> 원내 워크스페이스 <button id="logout" type="button" class="quiet" hidden>로그아웃</button></div>
+    </aside>
+    <main id="main" tabindex="-1"><p class="loading">원내 영상 스튜디오를 불러오는 중입니다.</p></main>
+  </div>
+  <dialog id="dialog" aria-label="영상 스튜디오 작업 창"></dialog>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
